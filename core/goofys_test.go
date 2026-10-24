@@ -566,6 +566,10 @@ func (s *GoofysTest) TestWriteLargeTruncateMem20M(t *C) {
 
 func (s *GoofysTest) diskCacheUsage(t *C) (total int64) {
 	err := filepath.Walk(s.fs.flags.CachePath, func(path string, info os.FileInfo, err error) error {
+		if os.IsNotExist(err) {
+			// Removed by the eviction goroutine while we were walking
+			return nil
+		}
 		if err == nil && !info.IsDir() {
 			total += info.Size()
 		}
@@ -582,14 +586,21 @@ func (s *GoofysTest) TestMaxDiskCacheSizeDiskCache10M(t *C) {
 	for i := 0; i < 8; i++ {
 		s.testWriteFile(t, "diskCacheFile"+strconv.Itoa(i), 6*1024*1024, 128*1024)
 	}
-	// Eviction is asynchronous, give the closer goroutine some time
+	// Eviction is asynchronous, so wait until it settles: the disk usage is
+	// within the limit and matches the accounted size. Both are sampled
+	// together and may change in between, so retry instead of asserting once.
+	var usage, accounted int64
 	deadline := time.Now().Add(10 * time.Second)
-	for s.diskCacheUsage(t) > limit && time.Now().Before(deadline) {
+	for {
+		accounted = s.fs.diskFdQueue.CurBytes()
+		usage = s.diskCacheUsage(t)
+		if usage <= limit && usage == accounted || !time.Now().Before(deadline) {
+			break
+		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	// Leave a margin of one file for the asynchronous eviction
-	t.Assert(s.diskCacheUsage(t) <= limit+6*1024*1024, Equals, true)
-	t.Assert(s.fs.diskFdQueue.curBytes, Equals, s.diskCacheUsage(t))
+	t.Assert(usage <= limit, Equals, true)
+	t.Assert(accounted, Equals, usage)
 	// Data must still be readable, from memory, disk cache or the server
 	for i := 0; i < 8; i++ {
 		in, err := s.fs.LookupPath("diskCacheFile" + strconv.Itoa(i))

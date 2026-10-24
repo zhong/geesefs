@@ -637,6 +637,14 @@ MISC OPTIONS:
 				"0 means unlimited. Least recently used cached files are evicted " +
 				"first when the limit is exceeded",
 		},
+
+		cli.BoolFlag{
+			Name: "clear-disk-cache-on-start",
+			Usage: "Delete everything inside the disk cache directory (--cache) on mount. " +
+				"Cache files left by a previous run are never reused, they only occupy space " +
+				"not counted by --max-disk-cache-size. Don't use it if the directory is shared " +
+				"with anything else, including other GeeseFS mounts",
+		},
 	}
 
 	if runtime.GOOS == "windows" {
@@ -920,6 +928,9 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 		// Cluster Mode
 		ClusterMode:           c.Bool("cluster"),
 		ClusterGrpcReflection: c.Bool("grpc-reflection"),
+
+		// Disk cache
+		ClearDiskCacheOnStart: c.Bool("clear-disk-cache-on-start"),
 	}
 
 	if runtime.GOOS == "windows" {

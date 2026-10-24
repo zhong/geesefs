@@ -15,8 +15,11 @@
 package core
 
 import (
+	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/yandex-cloud/geesefs/core/cfg"
 	. "gopkg.in/check.v1"
 )
 
@@ -133,6 +136,91 @@ func (s *FDQueueTest) TestUnlimited(t *C) {
 	var evicted []string
 	runExtra(q, evictAll(q, &evicted))
 	t.Assert(evicted, IsNil)
+}
+
+func (s *FDQueueTest) TestInsertFDTouchesSizeLRU(t *C) {
+	// Reopening a cache file whose FD was closed (to read it back) is a use
+	q := NewFDQueue(0)
+	q.SetMaxBytes(5)
+	a, b := &Inode{Name: "a"}, &Inode{Name: "b"}
+	q.InsertFD(a)
+	q.AddBytes(a, 3)
+	q.DeleteFD(a)
+	q.InsertFD(b)
+	q.AddBytes(b, 3)
+	q.InsertFD(a)
+
+	var evicted []string
+	runExtra(q, evictAll(q, &evicted))
+	t.Assert(evicted, DeepEquals, []string{"b"})
+}
+
+func (s *FDQueueTest) TestRetryAfterBecomingEligible(t *C) {
+	// Nothing is evictable at first, then it becomes evictable without any
+	// new cache write. OverSize must still report it, so the retrier wakes
+	// up the closer again.
+	q := NewFDQueue(0)
+	q.SetMaxBytes(1)
+	a := &Inode{Name: "a", Pinned: true}
+	q.AddBytes(a, 10)
+
+	var evicted []string
+	runExtra(q, evictAll(q, &evicted))
+	t.Assert(evicted, IsNil)
+	t.Assert(q.OverSize(), Equals, true)
+
+	a.Pinned = false
+	runExtra(q, evictAll(q, &evicted))
+	t.Assert(evicted, DeepEquals, []string{"a"})
+	t.Assert(q.OverSize(), Equals, false)
+	t.Assert(q.CurBytes(), Equals, int64(0))
+}
+
+func (s *FDQueueTest) TestClearDiskCache(t *C) {
+	dir := t.MkDir()
+	t.Assert(os.MkdirAll(filepath.Join(dir, "a", "b"), 0755), IsNil)
+	t.Assert(os.WriteFile(filepath.Join(dir, "a", "b", "f"), []byte("x"), 0644), IsNil)
+	t.Assert(os.WriteFile(filepath.Join(dir, "g"), []byte("y"), 0644), IsNil)
+
+	t.Assert(clearDiskCache(dir), IsNil)
+	entries, err := os.ReadDir(dir)
+	t.Assert(err, IsNil)
+	t.Assert(entries, HasLen, 0)
+	// The cache directory itself is kept
+	_, err = os.Stat(dir)
+	t.Assert(err, IsNil)
+	// A missing cache directory is fine
+	t.Assert(clearDiskCache(filepath.Join(dir, "missing")), IsNil)
+}
+
+func (s *FDQueueTest) TestOpenCacheFDTruncatesStaleFile(t *C) {
+	dir := t.MkDir()
+	fs := &Goofys{
+		flags:       &cfg.FlagStorage{CachePath: dir, CacheFileMode: 0644},
+		diskFdQueue: NewFDQueue(0),
+	}
+	// Left by a previous run, not accounted anywhere
+	stale := filepath.Join(dir, "f")
+	t.Assert(os.WriteFile(stale, make([]byte, 1000), 0644), IsNil)
+
+	inode := NewInode(fs, nil, "f")
+	t.Assert(inode.OpenCacheFD(), IsNil)
+	st, err := os.Stat(stale)
+	t.Assert(err, IsNil)
+	t.Assert(st.Size(), Equals, int64(0))
+	t.Assert(inode.OnDisk, Equals, true)
+
+	// Once something of this file is cached, reopening must keep it
+	_, err = inode.DiskCacheFD.WriteAt([]byte("data"), 0)
+	t.Assert(err, IsNil)
+	inode.DiskCacheFD.Close()
+	inode.DiskCacheFD = nil
+	fs.diskFdQueue.DeleteFD(inode)
+	t.Assert(inode.OpenCacheFD(), IsNil)
+	st, err = os.Stat(stale)
+	t.Assert(err, IsNil)
+	t.Assert(st.Size(), Equals, int64(4))
+	inode.DiskCacheFD.Close()
 }
 
 func (s *FDQueueTest) TestWakeupIsNotLost(t *C) {

@@ -80,6 +80,20 @@ func (l *FDQueue) Wakeup() {
 	l.mu.Unlock()
 }
 
+// OverSize reports whether the disk cache currently exceeds its size limit
+func (l *FDQueue) OverSize() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.overSizeLocked()
+}
+
+// CurBytes returns the current accounted size of the disk cache
+func (l *FDQueue) CurBytes() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.curBytes
+}
+
 func (l *FDQueue) overSizeLocked() bool {
 	return l.maxBytes > 0 && l.curBytes > l.maxBytes
 }
@@ -107,6 +121,10 @@ func (l *FDQueue) InsertFD(inode *Inode) {
 	l.curQueueID++
 	inode.DiskFDQueueID = l.curQueueID
 	l.q.Set(inode.DiskFDQueueID, inode)
+	if inode.DiskCacheBytes > 0 {
+		// Reopening the cache file to read it back is a use, too
+		l.touchSizeLocked(inode)
+	}
 	if l.overCountLocked() || l.overSizeLocked() {
 		// Wakeup the coroutine that closes old FDs / evicts old cache files
 		// This way we don't guarantee that we never exceed MaxDiskCacheFD/MaxDiskCacheSize
@@ -202,7 +220,8 @@ func (l *FDQueue) closeAndEvictExtraLocked(evictCacheFile func(inode *Inode) (fr
 			// Reached the end of the LRU order. Stop if this lap freed
 			// nothing at all (everything left is open/dirty/pinned), to
 			// avoid spinning forever - the goroutine will retry on the
-			// next wakeup. Otherwise start another lap.
+			// next wakeup (Goofys.DiskCacheRetrier sends one periodically
+			// while we're over the limit). Otherwise start another lap.
 			if !freedAnyThisLap {
 				break
 			}

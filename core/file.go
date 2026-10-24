@@ -225,7 +225,14 @@ func (inode *Inode) OpenCacheFD() error {
 		cacheFileName := fs.flags.CachePath + "/" + inode.FullName()
 		os.MkdirAll(path.Dir(cacheFileName), fs.flags.CacheFileMode|((fs.flags.CacheFileMode&0777)>>2))
 		var err error
-		inode.DiskCacheFD, err = os.OpenFile(cacheFileName, os.O_RDWR|os.O_CREATE, fs.flags.CacheFileMode)
+		flags := os.O_RDWR | os.O_CREATE
+		if !inode.OnDisk {
+			// Nothing of this file is cached on disk yet, so whatever is
+			// there is a stale leftover (e.g. from a previous run). Drop it,
+			// otherwise it would occupy space not accounted in DiskCacheBytes.
+			flags |= os.O_TRUNC
+		}
+		inode.DiskCacheFD, err = os.OpenFile(cacheFileName, flags, fs.flags.CacheFileMode)
 		if err != nil {
 			log.Errorf("Couldn't open %v: %v", cacheFileName, err)
 			return err
