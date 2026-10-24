@@ -103,6 +103,7 @@ type FlagStorage struct {
 	FlushFilename       string
 	CachePath           string
 	MaxDiskCacheFD      int64
+	MaxDiskCacheSize    int64
 	CacheFileMode       os.FileMode
 	PartSizes           []PartSizeConfig
 	UsePatch            bool

@@ -48,6 +48,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
@@ -561,6 +562,46 @@ func (s *GoofysTest) TestWriteLargeTruncateMem20M(t *C) {
 	resp, err := s.cloud.HeadBlob(&HeadBlobInput{Key: fileName})
 	t.Assert(err, IsNil)
 	t.Assert(resp.Size, Equals, uint64(100*1024*1024))
+}
+
+func (s *GoofysTest) diskCacheUsage(t *C) (total int64) {
+	err := filepath.Walk(s.fs.flags.CachePath, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			total += info.Size()
+		}
+		return err
+	})
+	t.Assert(err, IsNil)
+	return
+}
+
+func (s *GoofysTest) TestMaxDiskCacheSizeDiskCache10M(t *C) {
+	// Each file is 6 MB, so with 20 MB of memory older files get evicted to
+	// the disk cache, and with a 10 MB disk cache older cache files get removed
+	limit := s.fs.flags.MaxDiskCacheSize
+	for i := 0; i < 8; i++ {
+		s.testWriteFile(t, "diskCacheFile"+strconv.Itoa(i), 6*1024*1024, 128*1024)
+	}
+	// Eviction is asynchronous, give the closer goroutine some time
+	deadline := time.Now().Add(10 * time.Second)
+	for s.diskCacheUsage(t) > limit && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	// Leave a margin of one file for the asynchronous eviction
+	t.Assert(s.diskCacheUsage(t) <= limit+6*1024*1024, Equals, true)
+	t.Assert(s.fs.diskFdQueue.curBytes, Equals, s.diskCacheUsage(t))
+	// Data must still be readable, from memory, disk cache or the server
+	for i := 0; i < 8; i++ {
+		in, err := s.fs.LookupPath("diskCacheFile" + strconv.Itoa(i))
+		t.Assert(err, IsNil)
+		fh, err := in.OpenFile()
+		t.Assert(err, IsNil)
+		fr := &FileHandleReader{s.fs, fh, 0}
+		diff, err := CompareReader(io.LimitReader(fr, 6*1024*1024), io.LimitReader(&SeqReader{0}, 6*1024*1024), 0)
+		t.Assert(err, IsNil)
+		t.Assert(diff, Equals, -1)
+		fh.Release()
+	}
 }
 
 func (s *GoofysTest) TestEvictedRMWMem20M(t *C) {

@@ -629,6 +629,14 @@ MISC OPTIONS:
 			Value: 512,
 			Usage: "Simultaneously opened cache file descriptor limit",
 		},
+
+		cli.IntFlag{
+			Name:  "max-disk-cache-size",
+			Value: 0,
+			Usage: "Maximum total size in MB of the on-disk cache (--cache). " +
+				"0 means unlimited. Least recently used cached files are evicted " +
+				"first when the limit is exceeded",
+		},
 	}
 
 	if runtime.GOOS == "windows" {
@@ -887,6 +895,7 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 		RefreshAttr:         c.String("refresh-attr"),
 		CachePath:           c.String("cache"),
 		MaxDiskCacheFD:      int64(c.Int("max-disk-cache-fd")),
+		MaxDiskCacheSize:    int64(c.Int("max-disk-cache-size")) * 1024 * 1024,
 		CacheFileMode:       os.FileMode(c.Int("cache-file-mode")),
 		UsePatch:            c.Bool("enable-patch"),
 		DropPatchConflicts:  c.Bool("drop-patch-conflicts"),
@@ -1094,6 +1103,7 @@ func DefaultFlags() *FlagStorage {
 		RetryInterval:       30 * time.Second,
 		ReadRetryAttempts:   10,
 		MaxDiskCacheFD:      512,
+		MaxDiskCacheSize:    0,
 		RefreshFilename:     ".invalidate",
 		FlushFilename:       ".fsyncdir",
 		PartSizes: []PartSizeConfig{

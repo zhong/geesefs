@@ -117,6 +117,13 @@ type Inode struct {
 	DiskFDQueueID  uint64
 	DiskCacheFD    *os.File
 	OnDisk         bool
+	DiskCacheBytes int64
+	// Position in the on-disk cache size LRU (FDQueue.sizeQ)
+	DiskCacheQueueID uint64
+	// Pinned inodes are never evicted from the on-disk cache by size (--max-disk-cache-size),
+	// no matter how long ago they were last used. Nothing sets this yet, it's an extension
+	// point for a future "keep these paths resident" option.
+	Pinned         bool
 	forceFlush     bool
 	IsFlushing     int
 	flushError     error

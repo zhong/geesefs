@@ -504,6 +504,12 @@ func (s *GoofysTest) SetUpTest(t *C) {
 		// has to be set before create FS
 		flags.MemoryLimit = 100 * 1024 * 1024
 	}
+	if strings.Index(t.TestName(), "DiskCache10M") >= 0 {
+		// has to be set before create FS
+		flags.MemoryLimit = 20 * 1024 * 1024
+		flags.CachePath = t.MkDir()
+		flags.MaxDiskCacheSize = 10 * 1024 * 1024
+	}
 	if hasEnv("DEBUG") {
 		flags.DebugS3 = true
 		flags.DebugFuse = true

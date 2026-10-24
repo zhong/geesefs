@@ -353,7 +353,8 @@ func newGoofys(ctx context.Context, bucket string, flags *cfg.FlagStorage,
 
 	if fs.flags.CachePath != "" {
 		fs.diskFdQueue = NewFDQueue(int(fs.flags.MaxDiskCacheFD))
-		if fs.flags.MaxDiskCacheFD > 0 {
+		fs.diskFdQueue.SetMaxBytes(fs.flags.MaxDiskCacheSize)
+		if fs.flags.MaxDiskCacheFD > 0 || fs.flags.MaxDiskCacheSize > 0 {
 			go fs.FDCloser()
 		}
 	}
@@ -368,7 +369,7 @@ func (fs *Goofys) Shutdown() {
 	close(fs.shutdownCh)
 	fs.WakeupFlusher()
 	if fs.diskFdQueue != nil {
-		fs.diskFdQueue.cond.Broadcast()
+		fs.diskFdQueue.Wakeup()
 	}
 }
 
@@ -479,10 +480,10 @@ func (fs *Goofys) StatPrinter() {
 	}
 }
 
-// Close unneeded cache FDs
+// Close unneeded cache FDs and evict on-disk cache files over the size limit
 func (fs *Goofys) FDCloser() {
 	for atomic.LoadInt32(&fs.shutdown) == 0 {
-		fs.diskFdQueue.CloseExtra()
+		fs.diskFdQueue.CloseExtra(fs.EvictDiskCacheFile)
 	}
 }
 
@@ -530,8 +531,6 @@ func (fs *Goofys) FreeSomeCleanBuffers(origSize int64) (int64, bool) {
 	return freed, haveDirty
 }
 
-// FIXME: Implement disk cache size limit, add another btree.Map-based
-// "LRU" queue to delete old files from the disk.
 func (fs *Goofys) tryEvictToDisk(inode *Inode, buf *FileBuffer, toFs *int) {
 	if fs.flags.CachePath != "" && !buf.onDisk {
 		if *toFs == -1 {
@@ -550,10 +549,70 @@ func (fs *Goofys) tryEvictToDisk(inode *Inode, buf *FileBuffer, toFs *int) {
 						len(buf.data), buf.offset, fs.flags.CachePath+"/"+inode.FullName(), err)
 				} else {
 					buf.onDisk = true
+					// Account the cache file's extent, so rewriting an already
+					// cached range doesn't count it twice
+					end := int64(buf.offset) + int64(len(buf.data))
+					if end > inode.DiskCacheBytes {
+						fs.diskFdQueue.AddBytes(inode, end-inode.DiskCacheBytes)
+					} else {
+						fs.diskFdQueue.UseFD(inode)
+					}
 				}
 			}
 		}
 	}
+}
+
+// EvictDiskCacheFile deletes the on-disk cache file of inode (and drops the
+// in-memory record of the data it held) if, and only if, doing so is safe:
+// the inode must not be open, not have any dirty/in-flight data, not be in
+// the middle of a flush, and not be pinned. inode.mu must be held by the
+// caller. Returns the number of bytes freed, 0 if the inode wasn't eligible.
+//
+// This is deliberately conservative: a disk-cache-only buffer (onDisk=true,
+// data evicted from memory) has no other copy of its bytes anywhere, so we
+// can only drop the whole cache file once we're sure nothing still depends on
+// it - same rule the clean in-memory LRU already follows for BUF_CLEAN
+// buffers, just applied one layer down.
+func (fs *Goofys) EvictDiskCacheFile(inode *Inode) (freed int64) {
+	if inode.Pinned || atomic.LoadInt32(&inode.fileHandles) != 0 ||
+		inode.IsFlushing != 0 || inode.CacheState != ST_CACHED ||
+		inode.buffers.AnyUnclean() || !inode.OnDisk {
+		return 0
+	}
+	loading := false
+	inode.buffers.at.Ascend(0, func(end uint64, b *FileBuffer) bool {
+		if b.onDisk && b.loading {
+			loading = true
+			return false
+		}
+		return true
+	})
+	if loading {
+		// Someone is reading this file back from the disk cache right now
+		return 0
+	}
+	if inode.DiskCacheFD != nil {
+		inode.DiskCacheFD.Close()
+		inode.DiskCacheFD = nil
+		fs.diskFdQueue.DeleteFD(inode)
+	}
+	// Drop our record of the disk-resident ranges - their only copy is about
+	// to disappear, so they're no different from data we never cached at all.
+	allocated := inode.buffers.RemoveRange(0, 0xffffffffffffffff, func(b *FileBuffer) bool {
+		return b.onDisk
+	})
+	fs.bufferPool.Use(allocated, true)
+	cacheFileName := fs.flags.CachePath + "/" + inode.FullName()
+	err := os.Remove(cacheFileName)
+	if err != nil && !os.IsNotExist(err) {
+		log.Errorf("Couldn't remove %v: %v", cacheFileName, err)
+		return 0
+	}
+	inode.OnDisk = false
+	freed = inode.DiskCacheBytes
+	fs.diskFdQueue.AddBytes(inode, -freed)
+	return freed
 }
 
 func (fs *Goofys) WakeupFlusherAndWait(wait bool) {

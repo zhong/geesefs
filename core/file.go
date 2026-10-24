@@ -1443,10 +1443,13 @@ func (inode *Inode) resetCache() {
 		}
 		cacheFileName := inode.fs.flags.CachePath + "/" + inode.FullName()
 		err := os.Remove(cacheFileName)
-		if err != nil {
+		if err != nil && !os.IsNotExist(err) {
 			log.Errorf("Couldn't remove %v: %v", cacheFileName, err)
 		} else {
 			inode.OnDisk = false
+			if inode.DiskCacheBytes != 0 {
+				inode.fs.diskFdQueue.AddBytes(inode, -inode.DiskCacheBytes)
+			}
 		}
 	}
 	// And abort multipart upload, too
