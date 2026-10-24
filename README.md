@@ -111,6 +111,58 @@ Enabling patch uploads has the following benefits:
 
 Note: new files, metadata changes and renames are still flushed to S3 as multipart uploads.
 
+# Enhancements in this fork
+
+This fork (`zhong/geesefs`, branch `feature/max-disk-cache-size`) adds the following to upstream GeeseFS.
+
+## Disk cache size limit (`--max-disk-cache-size`)
+
+`--cache` alone lets the cache directory grow until the disk is full. `--max-disk-cache-size`
+caps its total size in MiB (default `0`, unlimited). When the cap is exceeded, the least
+recently used cached files are deleted until the cache is back under the limit:
+
+```
+geesefs --cache /var/cache/geesefs/my-bucket --max-disk-cache-size 51200 my-bucket /mnt/my-bucket
+```
+
+Only data that is already in S3 is ever evicted, so eviction never loses data. The limit
+is soft: while all cached data is open or dirty, the cache can temporarily exceed it.
+
+How it works:
+
+- **Accounting.** Each inode records how many bytes its cache file occupies, which is the
+  extent written so far. Rewriting an already cached range doesn't count it twice. The total
+  across all inodes is kept in `FDQueue` and updated on writes, renames and removals.
+- **LRU.** `FDQueue` now has two LRU queues. The existing one tracks open cache file
+  descriptors (`--max-disk-cache-fd`). The new size queue tracks every inode with data in the
+  disk cache. Writes, reads from the disk cache and reopens move an inode to the most recently
+  used end.
+- **Eviction.** When the total is over the limit, the `FDCloser` goroutine walks the size queue
+  from the least recently used end and deletes the whole cache file of each eligible inode.
+  An inode is eligible only if it is closed, not being flushed or read back from the disk cache,
+  not pinned, and has no dirty buffers. Its data is therefore already in S3 and can be fetched
+  again.
+- **Retry.** Eligibility can change without any write, for example when a file is closed or a
+  flush finishes. So `DiskCacheRetrier` wakes eviction every second while the cache is over the limit.
+- **Failure handling.** If a cache file can't be renamed, it stays at its old path, and that path
+  is reserved so no other file uses it. If it can't be removed, its bytes stay counted and its path
+  stays reserved until a background retry removes it. A stale file found where an inode has no
+  cached data is truncated the first time it is opened. Files left in the cache directory by a
+  previous run are not counted until they are opened, so use an empty directory for each mount.
+- **Shutdown.** `Shutdown` waits for the eviction and retry goroutines, so no cache file is
+  removed after it returns.
+
+Tests for this are in `core/fd_queue_test.go` and `core/goofys_test.go`.
+
+## Deployment examples
+
+- [contrib/systemd](contrib/systemd): a template unit for running a mount as a service on
+  Ubuntu 22.04 / 24.04, one instance per mount.
+- [contrib/k8s](contrib/k8s): a Dockerfile, a DaemonSet that mounts a bucket on every node, and
+  an example pod that uses the mount.
+
+See [Usage](#usage) and the sections below for details.
+
 # Installation
 
 * Pre-built binaries:
