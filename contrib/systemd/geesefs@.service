@@ -1,0 +1,41 @@
+# GeeseFS mount as a systemd service, one instance per mount.
+#
+# Each instance <name> reads its settings from /etc/geesefs/<name>.env
+# (see example.env) and gets its own cache directory /var/cache/geesefs/<name>.
+#
+#   systemctl enable --now geesefs@<name>
+#
+# The service is "ready" only after the file system is mounted, so other
+# units may use After=geesefs@<name>.service and Requires=geesefs@<name>.service.
+
+[Unit]
+Description=GeeseFS mount %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# geesefs forks into the background and its parent exits only after mounting
+# has succeeded or failed
+Type=forking
+EnvironmentFile=/etc/geesefs/%i.env
+# Cache directories must not be shared between mounts
+CacheDirectory=geesefs/%i
+CacheDirectoryMode=0700
+# Clean up a mount left behind by a crashed or killed geesefs, otherwise
+# mounting fails with "Transport endpoint is not connected"
+ExecStartPre=-/usr/bin/fusermount3 -uz ${MOUNTPOINT}
+ExecStartPre=/usr/bin/mkdir -p ${MOUNTPOINT}
+ExecStart=/usr/local/bin/geesefs --cache /var/cache/geesefs/%i $GEESEFS_OPTS ${BUCKET} ${MOUNTPOINT}
+# On SIGTERM geesefs unmounts and then flushes modified files to S3. While the
+# mount is busy it retries unmounting for 20 seconds and then waits for the
+# next signal, so keep sending SIGTERM until it exits
+ExecStop=/bin/sh -c 'while kill -TERM $MAINPID 2>/dev/null; do sleep 5; done'
+ExecStopPost=-/usr/bin/fusermount3 -uz ${MOUNTPOINT}
+# Flushing large files may take a while, after that geesefs is killed and
+# unflushed changes are lost
+TimeoutStopSec=600
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,89 @@
+# GeeseFS on every node as a DaemonSet. The bucket is mounted on the host at
+# /mnt/geesefs/my-bucket; pods use it with a hostPath volume of /mnt/geesefs
+# and mountPropagation: HostToContainer (see example-pod.yaml).
+#
+#   kubectl create namespace geesefs
+#   kubectl -n geesefs create secret generic geesefs-credentials \
+#     --from-literal=AWS_ACCESS_KEY_ID=... --from-literal=AWS_SECRET_ACCESS_KEY=...
+#   kubectl apply -f geesefs-daemonset.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: geesefs-config
+  namespace: geesefs
+data:
+  BUCKET: my-bucket
+  MOUNTPOINT: /mnt/geesefs/my-bucket
+  # Split on spaces. Alibaba Cloud OSS needs --subdomain and its region:
+  #   --endpoint https://oss-cn-beijing-internal.aliyuncs.com --subdomain --region oss-cn-beijing
+  GEESEFS_OPTS: >-
+    --endpoint https://s3.amazonaws.com
+    -o allow_other --file-mode 0666 --dir-mode 0777
+    --memory-limit 4000 --max-disk-cache-size 51200
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: geesefs
+  namespace: geesefs
+spec:
+  selector:
+    matchLabels:
+      app: geesefs
+  updateStrategy:
+    type: OnDelete
+  template:
+    metadata:
+      labels:
+        app: geesefs
+    spec:
+      # On SIGTERM geesefs unmounts and flushes modified files, give it time
+      terminationGracePeriodSeconds: 600
+      containers:
+        - name: geesefs
+          image: geesefs:local
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              # Clean up a mount left behind by a killed geesefs
+              fusermount3 -uz "$MOUNTPOINT" 2>/dev/null
+              mkdir -p "$MOUNTPOINT"
+              exec geesefs -f --cache /var/cache/geesefs $GEESEFS_OPTS "$BUCKET" "$MOUNTPOINT"
+          envFrom:
+            - configMapRef:
+                name: geesefs-config
+            - secretRef:
+                name: geesefs-credentials
+          securityContext:
+            # Needed for /dev/fuse, mounting and Bidirectional propagation
+            privileged: true
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              # Keep above --memory-limit: metadata and Go runtime use RAM too
+              memory: 6Gi
+          volumeMounts:
+            - name: mnt
+              mountPath: /mnt/geesefs
+              mountPropagation: Bidirectional
+            - name: cache
+              mountPath: /var/cache/geesefs
+            - name: fuse
+              mountPath: /dev/fuse
+      volumes:
+        - name: mnt
+          hostPath:
+            path: /mnt/geesefs
+            type: DirectoryOrCreate
+        # One cache directory per node and mount, not shared with others
+        - name: cache
+          hostPath:
+            path: /var/cache/geesefs/my-bucket
+            type: DirectoryOrCreate
+        - name: fuse
+          hostPath:
+            path: /dev/fuse
+            type: CharDevice

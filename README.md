@@ -1,3 +1,5 @@
+English | [简体中文](README.zh-CN.md)
+
 <img src="doc/geesefs.png" height="64" width="64" align="middle" />
 
 GeeseFS is a high-performance, POSIX-ish S3
@@ -147,6 +149,85 @@ bucket    /mnt/mountpoint    fuse.geesefs    _netdev,allow_other,--file-mode=066
 ```
 
 You can also use a different path to the credentials file by adding `,--shared-config=/path/to/credentials`.
+
+## systemd service (Ubuntu 22.04 / 24.04)
+
+Running GeeseFS as a service gives restarts after crashes, logs in journald and
+a clean unmount on shutdown. [contrib/systemd](contrib/systemd) has a template
+unit with one instance per mount. Both Ubuntu versions ship FUSE 3 and systemd
+recent enough for it:
+
+```
+sudo apt install fuse3
+sudo install -m 755 geesefs /usr/local/bin/geesefs
+sudo install -m 644 contrib/systemd/geesefs@.service /etc/systemd/system/
+sudo install -d -m 755 /etc/geesefs
+sudo install -m 600 contrib/systemd/example.env /etc/geesefs/my-bucket.env
+sudo editor /etc/geesefs/my-bucket.env    # bucket, mount point, credentials, options
+sudo systemctl daemon-reload
+sudo systemctl enable --now geesefs@my-bucket
+journalctl -u geesefs@my-bucket -f
+```
+
+Notes:
+
+- The unit runs geesefs as root, which is needed for `-o allow_other`. Use
+  `--uid`, `--gid`, `--file-mode` and `--dir-mode` to choose who can access files.
+  With `--uid`/`--gid` geesefs also switches to that user after mounting, and then
+  it can't write to the root-only cache directory. Add `--setuid 0 --setgid 0`
+  to keep running as root.
+- Every instance gets its own disk cache directory `/var/cache/geesefs/<name>`.
+  Set `--max-disk-cache-size` (MiB) to keep it from filling the disk.
+- `systemctl stop` unmounts and then waits until modified files are flushed to
+  S3, for up to 10 minutes (`TimeoutStopSec`). Stopping while some process
+  still uses the mount point waits until it leaves.
+- Units that use the mount can depend on it with `Requires=geesefs@my-bucket.service`
+  and `After=geesefs@my-bucket.service`. The service becomes active only after
+  the bucket is mounted.
+- Alibaba Cloud OSS needs `--subdomain` and the OSS region, for example
+  `--endpoint https://oss-cn-beijing-internal.aliyuncs.com --subdomain --region oss-cn-beijing`
+  (the internal endpoint works only from Alibaba Cloud machines in the same region;
+  use the public endpoint otherwise).
+
+## Kubernetes DaemonSet
+
+[contrib/k8s](contrib/k8s) runs GeeseFS on every node and mounts the bucket on
+the host at `/mnt/geesefs/<bucket>`. Pods use it as a `hostPath` volume of
+`/mnt/geesefs`.
+
+```
+docker build -f contrib/k8s/Dockerfile -t <registry>/geesefs:<version> .
+docker push <registry>/geesefs:<version>
+# set the image, bucket and options in contrib/k8s/geesefs-daemonset.yaml
+kubectl create namespace geesefs
+kubectl -n geesefs create secret generic geesefs-credentials \
+    --from-literal=AWS_ACCESS_KEY_ID=... --from-literal=AWS_SECRET_ACCESS_KEY=...
+kubectl apply -f contrib/k8s/geesefs-daemonset.yaml
+kubectl apply -f contrib/k8s/example-pod.yaml
+```
+
+Notes:
+
+- The GeeseFS container must be privileged, for `/dev/fuse` and for the
+  `Bidirectional` mount propagation that makes the mount visible on the host.
+- Pods must mount the parent directory `/mnt/geesefs` with
+  `mountPropagation: HostToContainer`, as in `example-pod.yaml`. Then they see
+  the bucket even when GeeseFS mounts it after the pod has started, and again
+  after GeeseFS restarts. Don't use the mount point itself as the `hostPath`:
+  the pod keeps its own copy of that mount, GeeseFS can't exit on restart until
+  that pod is deleted, and the pod never sees the new mount.
+- While the GeeseFS pod restarts, the bucket is missing in pods using it, and
+  open files return errors. Modified files not yet flushed to S3 are lost if
+  GeeseFS is killed. That is why the DaemonSet uses `updateStrategy: OnDelete`:
+  update GeeseFS node by node, after draining the node.
+- Keep the container memory limit well above `--memory-limit`, as metadata and
+  the Go runtime use memory too. Otherwise the kernel kills GeeseFS and any
+  unflushed changes are lost.
+- All nodes mount the same bucket. Read [Concurrent Updates](#concurrent-updates)
+  before writing the same files from several nodes.
+- This is a node-level mount, not a CSI driver: it doesn't create volumes per
+  PersistentVolumeClaim. For that, use a CSI driver such as
+  [csi-s3](https://github.com/yandex-cloud/k8s-csi-s3), which can use GeeseFS.
 
 See also: [Instruction for Azure Blob Storage](https://github.com/yandex-cloud/geesefs/blob/master/README-azure.md).
 

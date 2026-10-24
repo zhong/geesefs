@@ -1,0 +1,27 @@
+# A pod using the bucket mounted by geesefs-daemonset.yaml on its node.
+# The bucket is at /data/my-bucket.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: geesefs-example
+spec:
+  containers:
+    - name: app
+      image: ubuntu:24.04
+      command: ["sleep", "infinity"]
+      volumeMounts:
+        - name: geesefs
+          mountPath: /data
+          # The bucket mount propagates into the pod when geesefs mounts it,
+          # also if it starts after the pod, and is removed when geesefs
+          # unmounts. Without it the pod sees an empty directory.
+          mountPropagation: HostToContainer
+          readOnly: false
+  volumes:
+    # Mount the parent directory, not the mount point itself: a hostPath that
+    # is a FUSE mount is copied into the pod and that copy isn't removed when
+    # geesefs unmounts, so geesefs can't exit until the pod is deleted
+    - name: geesefs
+      hostPath:
+        path: /mnt/geesefs
+        type: Directory
