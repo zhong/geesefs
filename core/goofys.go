@@ -23,7 +23,6 @@ import (
 	"math/rand"
 	"net/url"
 	"os"
-	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -61,8 +60,12 @@ type Goofys struct {
 	bufferPool *BufferPool
 	wantFree   int32
 
-	shutdown   int32
-	shutdownCh chan struct{}
+	shutdown     int32
+	shutdownCh   chan struct{}
+	shutdownOnce sync.Once
+
+	// Waited for in Shutdown, so that no cache file is removed after it returns
+	diskCacheWg sync.WaitGroup
 
 	// A lock protecting the state of the file system struct itself (distinct
 	// from per-inode locks). Should be always taken after any inode locks.
@@ -116,6 +119,13 @@ type Goofys struct {
 	zeroBuf []byte
 
 	diskFdQueue *FDQueue
+	// Cache files left at an old path because renaming them failed, by that
+	// path (relative to CachePath). Nobody else may use these paths.
+	detachedCacheMu    sync.Mutex
+	detachedCacheFiles map[string]*Inode
+	// Cache files that couldn't be removed, by path, with their size.
+	// Their paths are reserved, too, until they're removed.
+	orphanCacheFiles map[string]int64
 
 	stats OpStats
 
@@ -309,15 +319,6 @@ func newGoofys(ctx context.Context, bucket string, flags *cfg.FlagStorage,
 	}
 	cloud.MultipartExpire(&MultipartExpireInput{})
 
-	if flags.CachePath != "" && flags.ClearDiskCacheOnStart {
-		// Cache files left by a previous run are never read back,
-		// they only occupy space not accounted by --max-disk-cache-size
-		err = clearDiskCache(flags.CachePath)
-		if err != nil {
-			return nil, fmt.Errorf("Couldn't clear disk cache %v: %v", flags.CachePath, err)
-		}
-	}
-
 	now := time.Now()
 	fs.rootAttrs = InodeAttributes{
 		Size:  4096,
@@ -365,11 +366,11 @@ func newGoofys(ctx context.Context, bucket string, flags *cfg.FlagStorage,
 		fs.diskFdQueue = NewFDQueue(int(fs.flags.MaxDiskCacheFD))
 		fs.diskFdQueue.SetMaxBytes(fs.flags.MaxDiskCacheSize)
 		if fs.flags.MaxDiskCacheFD > 0 || fs.flags.MaxDiskCacheSize > 0 {
+			fs.diskCacheWg.Add(1)
 			go fs.FDCloser()
 		}
-		if fs.flags.MaxDiskCacheSize > 0 {
-			go fs.DiskCacheRetrier()
-		}
+		fs.diskCacheWg.Add(1)
+		go fs.DiskCacheRetrier()
 	}
 
 	go fs.MetaEvictor()
@@ -378,12 +379,15 @@ func newGoofys(ctx context.Context, bucket string, flags *cfg.FlagStorage,
 }
 
 func (fs *Goofys) Shutdown() {
-	atomic.StoreInt32(&fs.shutdown, 1)
-	close(fs.shutdownCh)
-	fs.WakeupFlusher()
-	if fs.diskFdQueue != nil {
-		fs.diskFdQueue.Wakeup()
-	}
+	fs.shutdownOnce.Do(func() {
+		atomic.StoreInt32(&fs.shutdown, 1)
+		close(fs.shutdownCh)
+		fs.WakeupFlusher()
+		if fs.diskFdQueue != nil {
+			fs.diskFdQueue.Wakeup()
+		}
+	})
+	fs.diskCacheWg.Wait()
 }
 
 // from https://stackoverflow.com/questions/22892120/how-to-generate-a-random-string-of-a-fixed-length-in-golang
@@ -495,6 +499,7 @@ func (fs *Goofys) StatPrinter() {
 
 // Close unneeded cache FDs and evict on-disk cache files over the size limit
 func (fs *Goofys) FDCloser() {
+	defer fs.diskCacheWg.Done()
 	for atomic.LoadInt32(&fs.shutdown) == 0 {
 		fs.diskFdQueue.CloseExtra(fs.EvictDiskCacheFile)
 	}
@@ -502,33 +507,21 @@ func (fs *Goofys) FDCloser() {
 
 // Cache files can become evictable without any new disk cache write (file
 // closed, flush finished, disk read finished), so while we're over the size
-// limit, periodically retry eviction instead of waiting for the next write
+// limit, periodically retry eviction instead of waiting for the next write.
+// Also retry removing cache files that couldn't be removed before.
 func (fs *Goofys) DiskCacheRetrier() {
+	defer fs.diskCacheWg.Done()
 	for atomic.LoadInt32(&fs.shutdown) == 0 {
-		time.Sleep(time.Second)
+		select {
+		case <-fs.shutdownCh:
+			return
+		case <-time.After(time.Second):
+		}
+		fs.RetryOrphanCacheFiles()
 		if fs.diskFdQueue.OverSize() {
 			fs.diskFdQueue.Wakeup()
 		}
 	}
-}
-
-// clearDiskCache removes everything inside the cache directory, but not the
-// directory itself
-func clearDiskCache(cachePath string) error {
-	entries, err := os.ReadDir(cachePath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	for _, e := range entries {
-		err = os.RemoveAll(filepath.Join(cachePath, e.Name()))
-		if err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // Try to reclaim some clean buffers
@@ -590,7 +583,7 @@ func (fs *Goofys) tryEvictToDisk(inode *Inode, buf *FileBuffer, toFs *int) {
 				if err != nil {
 					*toFs = 0
 					log.Errorf("Couldn't write %v bytes at offset %v to %v: %v",
-						len(buf.data), buf.offset, fs.flags.CachePath+"/"+inode.FullName(), err)
+						len(buf.data), buf.offset, fs.flags.CachePath+"/"+inode.CacheFileName(), err)
 				} else {
 					buf.onDisk = true
 				}
@@ -642,13 +635,14 @@ func (fs *Goofys) EvictDiskCacheFile(inode *Inode) (freed int64) {
 		inode.DiskCacheFD = nil
 		fs.diskFdQueue.DeleteFD(inode)
 	}
-	cacheFileName := fs.flags.CachePath + "/" + inode.FullName()
+	cacheFileName := fs.flags.CachePath + "/" + inode.CacheFileName()
 	err := os.Remove(cacheFileName)
 	if err != nil && !os.IsNotExist(err) {
 		// The file is still there, so keep the buffers pointing to it
 		log.Errorf("Couldn't remove %v: %v", cacheFileName, err)
 		return 0
 	}
+	inode.setCacheFileAt("")
 	// Drop our record of the disk-resident ranges - their only copy is gone,
 	// so they're no different from data we never cached at all.
 	allocated := inode.buffers.RemoveRange(0, 0xffffffffffffffff, func(b *FileBuffer) bool {

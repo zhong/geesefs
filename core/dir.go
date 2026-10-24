@@ -1752,20 +1752,27 @@ func renameInCache(fromInode *Inode, newParent *Inode, to string) {
 	// Rename on-disk cache entry
 	if fromInode.OnDisk {
 		fs := fromInode.fs
-		oldFileName := fs.flags.CachePath + "/" + fromInode.FullName()
+		oldName := fromInode.CacheFileName()
+		oldFileName := fs.flags.CachePath + "/" + oldName
 		newDirName := fs.flags.CachePath + "/" + newParent.FullName()
 		newFileName := appendChildName(newDirName, to)
-		err := os.MkdirAll(newDirName, fs.flags.CacheFileMode|((fs.flags.CacheFileMode&0777)>>2))
-		if err == nil {
-			err = os.Rename(oldFileName, newFileName)
+		var err error
+		if fs.cacheFileTaken(appendChildName(newParent.FullName(), to), fromInode) {
+			// Holds the cache file of another inode, don't overwrite it
+			err = syscall.EBUSY
+		} else {
+			err = os.MkdirAll(newDirName, fs.flags.CacheFileMode|((fs.flags.CacheFileMode&0777)>>2))
+			if err == nil {
+				err = os.Rename(oldFileName, newFileName)
+			}
 		}
 		if err != nil {
+			// Keep using the file at its old path, it may hold the only copy
+			// of some data (dirty or already flushed from memory)
 			log.Warnf("Error renaming %v to %v: %v", oldFileName, newFileName, err)
-			if fromInode.DiskCacheFD != nil {
-				fromInode.DiskCacheFD.Close()
-				fromInode.DiskCacheFD = nil
-				fromInode.fs.diskFdQueue.DeleteFD(fromInode)
-			}
+			fromInode.setCacheFileAt(oldName)
+		} else {
+			fromInode.setCacheFileAt("")
 		}
 	}
 	fromInode.Ref()

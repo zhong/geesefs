@@ -129,9 +129,6 @@ type FlagStorage struct {
 	ClusterGrpcReflection bool
 	ClusterMe             *NodeConfig
 	ClusterPeers          []*NodeConfig
-
-	// Disk cache: remove everything inside CachePath on mount
-	ClearDiskCacheOnStart bool
 }
 
 func (flags *FlagStorage) GetMimeType(fileName string) (retMime *string) {

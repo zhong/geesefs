@@ -17,6 +17,8 @@ package core
 import (
 	"os"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/yandex-cloud/geesefs/core/cfg"
@@ -176,23 +178,6 @@ func (s *FDQueueTest) TestRetryAfterBecomingEligible(t *C) {
 	t.Assert(q.CurBytes(), Equals, int64(0))
 }
 
-func (s *FDQueueTest) TestClearDiskCache(t *C) {
-	dir := t.MkDir()
-	t.Assert(os.MkdirAll(filepath.Join(dir, "a", "b"), 0755), IsNil)
-	t.Assert(os.WriteFile(filepath.Join(dir, "a", "b", "f"), []byte("x"), 0644), IsNil)
-	t.Assert(os.WriteFile(filepath.Join(dir, "g"), []byte("y"), 0644), IsNil)
-
-	t.Assert(clearDiskCache(dir), IsNil)
-	entries, err := os.ReadDir(dir)
-	t.Assert(err, IsNil)
-	t.Assert(entries, HasLen, 0)
-	// The cache directory itself is kept
-	_, err = os.Stat(dir)
-	t.Assert(err, IsNil)
-	// A missing cache directory is fine
-	t.Assert(clearDiskCache(filepath.Join(dir, "missing")), IsNil)
-}
-
 func (s *FDQueueTest) TestOpenCacheFDTruncatesStaleFile(t *C) {
 	dir := t.MkDir()
 	fs := &Goofys{
@@ -221,6 +206,167 @@ func (s *FDQueueTest) TestOpenCacheFDTruncatesStaleFile(t *C) {
 	t.Assert(err, IsNil)
 	t.Assert(st.Size(), Equals, int64(4))
 	inode.DiskCacheFD.Close()
+}
+
+func (s *FDQueueTest) TestDetachedCacheFile(t *C) {
+	// Renaming the cache file of "a" to "b" failed, so it stays at "a"
+	dir := t.MkDir()
+	fs := &Goofys{
+		flags:       &cfg.FlagStorage{CachePath: dir, CacheFileMode: 0644},
+		diskFdQueue: NewFDQueue(0),
+		bufferPool:  NewBufferPool(1<<30, 0),
+	}
+	a := NewInode(fs, nil, "a")
+	t.Assert(a.OpenCacheFD(), IsNil)
+	_, err := a.DiskCacheFD.WriteAt([]byte("data"), 0)
+	t.Assert(err, IsNil)
+	fs.diskFdQueue.AddBytes(a, 4)
+	a.setCacheFileAt("a")
+	a.Name = "b"
+	t.Assert(a.CacheFileName(), Equals, "a")
+	a.DiskCacheFD.Close()
+	a.DiskCacheFD = nil
+	fs.diskFdQueue.DeleteFD(a)
+
+	// A new inode named "a" must not truncate it
+	other := NewInode(fs, nil, "a")
+	t.Assert(other.OpenCacheFD(), NotNil)
+	data, err := os.ReadFile(filepath.Join(dir, "a"))
+	t.Assert(err, IsNil)
+	t.Assert(string(data), Equals, "data")
+
+	// The renamed inode still uses it
+	t.Assert(a.OpenCacheFD(), IsNil)
+	buf := make([]byte, 4)
+	_, err = a.DiskCacheFD.ReadAt(buf, 0)
+	t.Assert(err, IsNil)
+	t.Assert(string(buf), Equals, "data")
+	_, err = os.Stat(filepath.Join(dir, "b"))
+	t.Assert(os.IsNotExist(err), Equals, true)
+
+	// Evicting removes the file at the old path and frees it
+	t.Assert(fs.EvictDiskCacheFile(a), Equals, int64(4))
+	_, err = os.Stat(filepath.Join(dir, "a"))
+	t.Assert(os.IsNotExist(err), Equals, true)
+	t.Assert(a.CacheFileName(), Equals, "b")
+	t.Assert(fs.detachedCacheFiles, HasLen, 0)
+	t.Assert(other.OpenCacheFD(), IsNil)
+	other.DiskCacheFD.Close()
+}
+
+func (s *FDQueueTest) TestResetCacheRemoveFailure(t *C) {
+	// A cache file that resetCache couldn't remove stays accounted and
+	// reserved until a retry removes it
+	if os.Geteuid() == 0 {
+		t.Skip("root can remove files in read-only directories")
+	}
+	dir := t.MkDir()
+	fs := &Goofys{
+		flags:       &cfg.FlagStorage{CachePath: dir, CacheFileMode: 0644},
+		diskFdQueue: NewFDQueue(0),
+		bufferPool:  NewBufferPool(1<<30, 0),
+	}
+	a := NewInode(fs, nil, "a")
+	t.Assert(a.OpenCacheFD(), IsNil)
+	_, err := a.DiskCacheFD.WriteAt([]byte("data"), 0)
+	t.Assert(err, IsNil)
+	fs.diskFdQueue.AddBytes(a, 4)
+	a.DiskCacheFD.Close()
+	a.DiskCacheFD = nil
+	fs.diskFdQueue.DeleteFD(a)
+	// Removing the regular cache file fails in a read-only directory
+	t.Assert(os.Chmod(dir, 0555), IsNil)
+	defer os.Chmod(dir, 0755)
+
+	a.mu.Lock()
+	a.resetCache()
+	a.mu.Unlock()
+	t.Assert(a.OnDisk, Equals, false)
+	t.Assert(a.DiskCacheBytes, Equals, int64(0))
+	t.Assert(a.DiskCacheQueueID, Equals, uint64(0))
+	t.Assert(fs.diskFdQueue.CurBytes(), Equals, int64(4))
+	t.Assert(fs.diskFdQueue.sizeQ.Len(), Equals, 0)
+	// Nobody may reuse the path meanwhile, and the file must not be truncated
+	cacheFile := filepath.Join(dir, "a")
+	other := NewInode(fs, nil, "a")
+	t.Assert(other.OpenCacheFD(), Equals, syscall.EBUSY)
+	data, err := os.ReadFile(cacheFile)
+	t.Assert(err, IsNil)
+	t.Assert(string(data), Equals, "data")
+
+	// Still failing: nothing changes
+	fs.RetryOrphanCacheFiles()
+	t.Assert(fs.diskFdQueue.CurBytes(), Equals, int64(4))
+	t.Assert(fs.orphanCacheFiles, HasLen, 1)
+
+	// Removable now: bytes and path are released
+	t.Assert(os.Chmod(dir, 0755), IsNil)
+	fs.RetryOrphanCacheFiles()
+	t.Assert(fs.diskFdQueue.CurBytes(), Equals, int64(0))
+	t.Assert(fs.orphanCacheFiles, HasLen, 0)
+	_, err = os.Stat(cacheFile)
+	t.Assert(os.IsNotExist(err), Equals, true)
+	t.Assert(other.OpenCacheFD(), IsNil)
+	other.DiskCacheFD.Close()
+}
+
+func (s *FDQueueTest) TestShutdownStopsDiskCacheRetrier(t *C) {
+	// Once Shutdown has returned, the retrier must not remove cache files anymore
+	dir := t.MkDir()
+	fs := &Goofys{
+		flags:            &cfg.FlagStorage{CachePath: dir},
+		diskFdQueue:      NewFDQueue(0),
+		shutdownCh:       make(chan struct{}),
+		orphanCacheFiles: map[string]int64{},
+	}
+	fs.flusherCond = sync.NewCond(&fs.flusherMu)
+	fs.diskCacheWg.Add(1)
+	go fs.DiskCacheRetrier()
+	fs.Shutdown()
+
+	// The retrier would remove this orphan on its next pass if it were still running
+	t.Assert(os.WriteFile(filepath.Join(dir, "orphan"), []byte("data"), 0644), IsNil)
+	fs.orphanCacheFiles["orphan"] = 4
+	fs.diskFdQueue.AddOrphanBytes(4)
+	time.Sleep(1500 * time.Millisecond)
+	_, err := os.Stat(filepath.Join(dir, "orphan"))
+	t.Assert(err, IsNil)
+	t.Assert(fs.orphanCacheFiles, HasLen, 1)
+}
+
+func (s *FDQueueTest) TestShutdownTwice(t *C) {
+	// Unmount calls Shutdown even if unmounting failed, and is retried on the
+	// next signal, so Shutdown may be called again, concurrently or not
+	fs := &Goofys{
+		flags:            &cfg.FlagStorage{CachePath: t.MkDir()},
+		diskFdQueue:      NewFDQueue(0),
+		shutdownCh:       make(chan struct{}),
+		orphanCacheFiles: map[string]int64{},
+	}
+	fs.flusherCond = sync.NewCond(&fs.flusherMu)
+	fs.diskCacheWg.Add(2)
+	go fs.DiskCacheRetrier()
+	go fs.FDCloser()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			fs.Shutdown()
+			wg.Done()
+		}()
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		fs.Shutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown didn't return")
+	}
 }
 
 func (s *FDQueueTest) TestWakeupIsNotLost(t *C) {

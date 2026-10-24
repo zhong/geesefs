@@ -219,10 +219,106 @@ func (fh *FileHandle) WriteFile(offset int64, data []byte, copyData bool) (err e
 	return
 }
 
+// CacheFileName returns the path of this inode's cache file relative to
+// CachePath. It differs from FullName() when renaming the cache file failed
+// but the inode was renamed anyway.
+// LOCKS_REQUIRED(inode.mu)
+func (inode *Inode) CacheFileName() string {
+	if inode.diskCachePath != "" {
+		return inode.diskCachePath
+	}
+	return inode.FullName()
+}
+
+// setCacheFileAt records that the cache file of inode stays at cacheFileName
+// (relative to CachePath) instead of following its name, and reserves that
+// path, so that no other inode truncates or overwrites the file. An empty
+// cacheFileName means the file is at FullName() again, or gone.
+// LOCKS_REQUIRED(inode.mu)
+func (inode *Inode) setCacheFileAt(cacheFileName string) {
+	if inode.diskCachePath == cacheFileName {
+		return
+	}
+	fs := inode.fs
+	fs.detachedCacheMu.Lock()
+	if inode.diskCachePath != "" {
+		delete(fs.detachedCacheFiles, inode.diskCachePath)
+	}
+	if cacheFileName != "" {
+		if fs.detachedCacheFiles == nil {
+			fs.detachedCacheFiles = make(map[string]*Inode)
+		}
+		fs.detachedCacheFiles[cacheFileName] = inode
+	}
+	fs.detachedCacheMu.Unlock()
+	inode.diskCachePath = cacheFileName
+}
+
+// cacheFileTaken checks if cacheFileName (relative to CachePath) holds the
+// cache file of another inode, left there because renaming it failed.
+func (fs *Goofys) cacheFileTaken(cacheFileName string, inode *Inode) bool {
+	fs.detachedCacheMu.Lock()
+	owner := fs.detachedCacheFiles[cacheFileName]
+	_, orphan := fs.orphanCacheFiles[cacheFileName]
+	fs.detachedCacheMu.Unlock()
+	return orphan || owner != nil && owner != inode
+}
+
+// orphanCacheFile takes over the cache file of inode which couldn't be
+// removed: its bytes stay in the size accounting, but not in the inode's,
+// and its path stays reserved until RetryOrphanCacheFiles removes it.
+// LOCKS_REQUIRED(inode.mu)
+func (fs *Goofys) orphanCacheFile(inode *Inode) {
+	cacheFileName := inode.CacheFileName()
+	size := inode.DiskCacheBytes
+	fs.detachedCacheMu.Lock()
+	if inode.diskCachePath != "" {
+		delete(fs.detachedCacheFiles, inode.diskCachePath)
+		inode.diskCachePath = ""
+	}
+	if fs.orphanCacheFiles == nil {
+		fs.orphanCacheFiles = make(map[string]int64)
+	}
+	fs.orphanCacheFiles[cacheFileName] += size
+	fs.detachedCacheMu.Unlock()
+	fs.diskFdQueue.MoveBytesToOrphans(inode)
+}
+
+// RetryOrphanCacheFiles tries to remove cache files that couldn't be removed
+// before, and releases their paths and bytes once they're gone
+func (fs *Goofys) RetryOrphanCacheFiles() {
+	fs.detachedCacheMu.Lock()
+	names := make([]string, 0, len(fs.orphanCacheFiles))
+	for name := range fs.orphanCacheFiles {
+		names = append(names, name)
+	}
+	fs.detachedCacheMu.Unlock()
+	for _, name := range names {
+		if atomic.LoadInt32(&fs.shutdown) != 0 {
+			return
+		}
+		// The path is reserved, so nobody else creates a file there meanwhile
+		err := os.Remove(fs.flags.CachePath + "/" + name)
+		if err != nil && !os.IsNotExist(err) {
+			continue
+		}
+		fs.detachedCacheMu.Lock()
+		size := fs.orphanCacheFiles[name]
+		delete(fs.orphanCacheFiles, name)
+		fs.detachedCacheMu.Unlock()
+		fs.diskFdQueue.AddOrphanBytes(-size)
+	}
+}
+
 func (inode *Inode) OpenCacheFD() error {
 	fs := inode.fs
 	if inode.DiskCacheFD == nil {
-		cacheFileName := fs.flags.CachePath + "/" + inode.FullName()
+		if fs.cacheFileTaken(inode.CacheFileName(), inode) {
+			// Don't truncate or mix into the file of another inode. This
+			// inode just doesn't use the disk cache until the path is free.
+			return syscall.EBUSY
+		}
+		cacheFileName := fs.flags.CachePath + "/" + inode.CacheFileName()
 		os.MkdirAll(path.Dir(cacheFileName), fs.flags.CacheFileMode|((fs.flags.CacheFileMode&0777)>>2))
 		var err error
 		flags := os.O_RDWR | os.O_CREATE
@@ -1448,16 +1544,22 @@ func (inode *Inode) resetCache() {
 			inode.DiskCacheFD = nil
 			inode.fs.diskFdQueue.DeleteFD(inode)
 		}
-		cacheFileName := inode.fs.flags.CachePath + "/" + inode.FullName()
+		cacheFileName := inode.fs.flags.CachePath + "/" + inode.CacheFileName()
 		err := os.Remove(cacheFileName)
 		if err != nil && !os.IsNotExist(err) {
 			log.Errorf("Couldn't remove %v: %v", cacheFileName, err)
+			// All buffers are dropped, so this inode doesn't need the file
+			// anymore, but it still occupies disk space. Hand it over to the
+			// orphan list: it stays accounted and reserved (so nobody reuses
+			// the path), and its removal is retried in the background.
+			inode.fs.orphanCacheFile(inode)
 		} else {
-			inode.OnDisk = false
+			inode.setCacheFileAt("")
 			if inode.DiskCacheBytes != 0 {
 				inode.fs.diskFdQueue.AddBytes(inode, -inode.DiskCacheBytes)
 			}
 		}
+		inode.OnDisk = false
 	}
 	// And abort multipart upload, too
 	if inode.mpu != nil {

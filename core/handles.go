@@ -118,6 +118,11 @@ type Inode struct {
 	DiskCacheFD    *os.File
 	OnDisk         bool
 	DiskCacheBytes int64
+	// The real path to the cache file on disk, when it differs from the current
+	// FullName() (because renaming the cache file failed but the inode was renamed
+	// anyway). Empty means the path matches FullName(). All cache file operations
+	// use CacheFileName() to get the correct path.
+	diskCachePath string
 	// Position in the on-disk cache size LRU (FDQueue.sizeQ)
 	DiskCacheQueueID uint64
 	// Pinned inodes are never evicted from the on-disk cache by size (--max-disk-cache-size),

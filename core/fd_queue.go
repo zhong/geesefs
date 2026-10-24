@@ -68,6 +68,25 @@ func (l *FDQueue) AddBytes(inode *Inode, delta int64) {
 	l.mu.Unlock()
 }
 
+// MoveBytesToOrphans removes inode from the size LRU, but keeps its bytes in
+// the total, because its cache file is still on disk (see orphanCacheFile)
+func (l *FDQueue) MoveBytesToOrphans(inode *Inode) {
+	l.mu.Lock()
+	inode.DiskCacheBytes = 0
+	l.touchSizeLocked(inode)
+	l.mu.Unlock()
+}
+
+// AddOrphanBytes changes the total by delta bytes not owned by any inode
+func (l *FDQueue) AddOrphanBytes(delta int64) {
+	l.mu.Lock()
+	l.curBytes += delta
+	if l.overSizeLocked() {
+		l.wakeupLocked()
+	}
+	l.mu.Unlock()
+}
+
 func (l *FDQueue) wakeupLocked() {
 	l.wakeup = true
 	l.cond.Broadcast()

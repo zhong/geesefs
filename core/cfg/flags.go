@@ -18,6 +18,7 @@ package cfg
 
 import (
 	"io"
+	"math"
 	"os"
 	"runtime"
 	"strconv"
@@ -96,7 +97,7 @@ MISC OPTIONS:
 
 		cli.StringFlag{
 			Name:  "cache",
-			Usage: "Directory to use for data cache. (default: off)",
+			Usage: "Directory to use for data cache. Must not be shared with other GeeseFS mounts. (default: off)",
 		},
 
 		cli.IntFlag{
@@ -630,20 +631,13 @@ MISC OPTIONS:
 			Usage: "Simultaneously opened cache file descriptor limit",
 		},
 
-		cli.IntFlag{
+		cli.Int64Flag{
 			Name:  "max-disk-cache-size",
 			Value: 0,
-			Usage: "Maximum total size in MB of the on-disk cache (--cache). " +
+			Usage: "Maximum total size in MiB of the on-disk cache (--cache). " +
 				"0 means unlimited. Least recently used cached files are evicted " +
-				"first when the limit is exceeded",
-		},
-
-		cli.BoolFlag{
-			Name: "clear-disk-cache-on-start",
-			Usage: "Delete everything inside the disk cache directory (--cache) on mount. " +
-				"Cache files left by a previous run are never reused, they only occupy space " +
-				"not counted by --max-disk-cache-size. Don't use it if the directory is shared " +
-				"with anything else, including other GeeseFS mounts",
+				"first when the limit is exceeded. Files left in the directory by a " +
+				"previous run are not counted, so empty it before mounting",
 		},
 	}
 
@@ -847,6 +841,11 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 		panic("--read-retry-attempts must be at least 1")
 	}
 
+	maxDiskCacheSize := c.Int64("max-disk-cache-size")
+	if maxDiskCacheSize < 0 || maxDiskCacheSize > math.MaxInt64/(1024*1024) {
+		panic("--max-disk-cache-size must be between 0 and " + strconv.FormatInt(math.MaxInt64/(1024*1024), 10))
+	}
+
 	flags := &FlagStorage{
 		// File system
 		MountOptions:                       c.StringSlice("o"),
@@ -903,7 +902,7 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 		RefreshAttr:         c.String("refresh-attr"),
 		CachePath:           c.String("cache"),
 		MaxDiskCacheFD:      int64(c.Int("max-disk-cache-fd")),
-		MaxDiskCacheSize:    int64(c.Int("max-disk-cache-size")) * 1024 * 1024,
+		MaxDiskCacheSize:    maxDiskCacheSize * 1024 * 1024,
 		CacheFileMode:       os.FileMode(c.Int("cache-file-mode")),
 		UsePatch:            c.Bool("enable-patch"),
 		DropPatchConflicts:  c.Bool("drop-patch-conflicts"),
@@ -928,9 +927,6 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 		// Cluster Mode
 		ClusterMode:           c.Bool("cluster"),
 		ClusterGrpcReflection: c.Bool("grpc-reflection"),
-
-		// Disk cache
-		ClearDiskCacheOnStart: c.Bool("clear-disk-cache-on-start"),
 	}
 
 	if runtime.GOOS == "windows" {
